@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dbmigrate — database migration wrapper for dbmate
+# Owens OnLine · Database Platform
+#
+# Reads a named connection profile from ~/.my.cnf using my_print_defaults,
+# constructs DATABASE_URL in memory, and runs dbmate in Docker. Credentials
+# are never written to disk or exposed in shell history.
+#
+# USAGE:
+#   ./dbmigrate [-p <profile>] [-s <schema>] <dbmate command> [args]
+#
+# CREDENTIAL FALLBACK CHAIN:
+#   1. -p/--profile + -s/--schema   (args)
+#   2. DBMATE_PROFILE + DBMATE_SCHEMA   (env vars)
+#   3. .env file in repo root   (DATABASE_URL=mysql://...)
+#   4. Exit 1 with setup instructions
+#
+# REQUIRED ~/.my.cnf PROFILE:
+#   [dev]
+#   user     = app_user
+#   password = yourpassword
+#   host     = sandbox-db
+#   port     = 3306
+#
+# OVERRIDABLE ENV VARS:
+#   DBMATE_PROFILE      Connection profile name (replaces -p)
+#   DBMATE_SCHEMA       Target schema name (replaces -s)
+#   DBMIGRATE_NETWORK   Docker network (default: sandbox-net)
+#
+# One-time setup:
+#   1. Add the [dev] group to ~/.my.cnf
+#   2. chmod 600 ~/.my.cnf
+#   3. chmod +x dbmigrate
+#   4. Optionally add to ~/.bashrc or ~/.zshrc:
+#        export DBMATE_PROFILE=dev
+#        export DBMATE_SCHEMA=my_app
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+readonly DBMATE_IMAGE="ghcr.io/amacneil/dbmate:2.31.0"
+readonly DOCKER_NETWORK="${DBMIGRATE_NETWORK:-host}"
+readonly MIGRATIONS_DIR="db/migrations"
+readonly SCHEMA_FILE="db/schema.sql"
+readonly DB_OPTIONS="tls=false&allowNativePasswords=true"
+readonly ENV_FILE=".env"
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+error() { echo "ERROR: $*" >&2; }
+info()  { echo "dbmigrate: $*"; }
+
+# -----------------------------------------------------------------------------
+# DATABASE URL VALIDATION
+#
+# Two-level check run after DATABASE_URL is constructed, before docker run:
+#   1. Structural — regex parse confirms scheme, user, host, port, schema
+#   2. Network    — bash /dev/tcp confirms host:port is reachable (3s timeout)
+#
+# Covers all credential paths: profile, .env, and env var.
+# Uses bash built-in /dev/tcp — no nc, curl, or mysql client required.
+# -----------------------------------------------------------------------------
+validate_database_url() {
+  local url="$1"
+
+  # ── Level 1: structural parse ──────────────────────────────────────────────
+  # Expected form: mysql://user:pass@host:port/schema?options
+  # Regex captures: user, pass, host, port, schema
+  local pattern='^mysql://([^:]+):([^@]+)@([^:/]+):([0-9]+)/([^?]+)'
+
+  if [[ ! "$url" =~ $pattern ]]; then
+    error "DATABASE_URL is malformed."
+    error "Expected: mysql://user:password@host:port/schema?options"
+    error "Got:      ${url//:*@/:********@}"   # mask password in output
+    exit 1
+  fi
+
+  local db_host="${BASH_REMATCH[3]}"
+  local db_port="${BASH_REMATCH[4]}"
+  local db_schema="${BASH_REMATCH[5]}"
+
+  # Guard against empty segments that the regex might pass through
+  if [ -z "$db_host" ]; then
+    error "DATABASE_URL is missing a host."
+    exit 1
+  fi
+  if [ -z "$db_schema" ]; then
+    error "DATABASE_URL is missing a schema (database) name."
+    error "Pass -s/--schema or set DBMATE_SCHEMA."
+    exit 1
+  fi
+
+  info "URL structure OK — schema: ${db_schema}, host: ${db_host}:${db_port}"
+  info "DATABASE_URL is $(echo "$DATABASE_URL" | sed 's|:[^@]*@|:*****@|')"
+
+  # ── Level 2: TCP reachability ──────────────────────────────────────────────
+  info "Checking connectivity to ${db_host}:${db_port} ..."
+
+  if (
+    timeout 3 bash -c "
+      exec 3<>/dev/tcp/${db_host}/${db_port}
+    " 2>/dev/null
+  ); then
+    info "Host ${db_host}:${db_port} is reachable."
+  else
+    error "Cannot reach ${db_host}:${db_port} (timeout 3s)."
+    error "Check that:"
+    error "  - The database container or host is running"
+    error "  - Docker network '${DOCKER_NETWORK}' is correct (override with DBMIGRATE_NETWORK)"
+    error "  - Host '${db_host}' resolves correctly from this machine"
+    exit 1
+  fi
+}
+
+print_setup_instructions() {
+  cat >&2 <<EOF
+
+No credentials found. Choose one of the following options:
+
+─── Option A: ~/.my.cnf profile (recommended) ──────────────────────────────
+
+  Add this to ~/.my.cnf and run: chmod 600 ~/.my.cnf
+
+  [dev]
+  user     = your_mysql_user
+  password = your_mysql_password
+  host     = sandbox-db
+  port     = 3306
+
+  Then run:
+    ./dbmigrate -p dev -s my_app migrate
+
+  Or set env vars in ~/.bashrc / ~/.zshrc to avoid typing them each time:
+    export DBMATE_PROFILE=dev
+    export DBMATE_SCHEMA=my_app
+
+─── Option B: .env file (fallback) ─────────────────────────────────────────
+
+  Create .env in the repo root (already in .gitignore):
+    DATABASE_URL=mysql://user:pass@sandbox-db:3306/my_app?tls=false&allowNativePasswords=true
+
+  NOTE: .env MUST be present in .gitignore before dbmigrate will use it.
+
+─────────────────────────────────────────────────────────────────────────────
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# SETUP WIZARD: create a missing ~/.my.cnf profile interactively
+#
+# Triggered when -p/--profile is given but the named group does not exist in
+# ~/.my.cnf. Prompts for credentials, shows a preview, asks for confirmation,
+# then appends the group and sets chmod 600. Execution continues normally
+# after the wizard — no need to re-run the script.
+#
+# Password input uses `read -s` so it is never echoed to the terminal.
+# The wizard does NOT run if the group header already exists in ~/.my.cnf —
+# a partial/malformed entry is flagged for manual correction instead.
+# -----------------------------------------------------------------------------
+setup_profile_wizard() {
+  local profile="$1"
+  local mycnf="${HOME}/.my.cnf"
+
+  echo
+  echo "─────────────────────────────────────────────────────────────────────────────"
+  echo "  Profile [${profile}] not found in ${mycnf}"
+  echo "  Let's create it now."
+  echo "─────────────────────────────────────────────────────────────────────────────"
+  echo
+
+  # Prompt for each field — password is silent
+  read -r -p "  MySQL user:           " wizard_user
+  read -r -s -p "  MySQL password:       " wizard_pass; echo
+  read -r -p "  MySQL host:           " wizard_host
+  read -r -p "  MySQL port [3306]:    " wizard_port
+  wizard_port="${wizard_port:-3306}"
+
+  # Validate nothing critical was left blank
+  if [ -z "$wizard_user" ] || [ -z "$wizard_pass" ] || [ -z "$wizard_host" ]; then
+    echo
+    error "User, password, and host are required. Profile not created."
+    exit 1
+  fi
+
+  # Preview what will be written
+  echo
+  echo "  The following will be appended to ${mycnf}:"
+  echo
+  echo "    [${profile}]"
+  echo "    user     = ${wizard_user}"
+  echo "    password = ********"
+  echo "    host     = ${wizard_host}"
+  echo "    port     = ${wizard_port}"
+  echo
+
+  read -r -p "  Write profile and continue? [y/N]: " confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo
+    error "Aborted. Profile not created."
+    exit 1
+  fi
+
+  # Append the group to ~/.my.cnf, creating the file if needed
+  {
+    echo
+    echo "[${profile}]"
+    echo "user     = ${wizard_user}"
+    echo "password = ${wizard_pass}"
+    echo "host     = ${wizard_host}"
+    echo "port     = ${wizard_port}"
+  } >> "$mycnf"
+
+  chmod 600 "$mycnf"
+  unset wizard_user wizard_pass wizard_host wizard_port
+
+  echo
+  info "Profile [${profile}] written to ${mycnf} (chmod 600)."
+  echo
+}
+
+# -----------------------------------------------------------------------------
+# PREFLIGHT: .env gitignore check
+#
+# Uses `git check-ignore` — evaluates all gitignore rules correctly including
+# local .gitignore, parent directories, and the user's global gitignore.
+# Handles patterns like *.env, .env*, /.env transparently.
+# Runs unconditionally: a .env in the repo is a risk on any credential path.
+# -----------------------------------------------------------------------------
+preflight_env_gitignore_check() {
+  [ ! -f "$ENV_FILE" ] && return 0
+
+  if ! git rev-parse --git-dir &>/dev/null; then
+    info "Warning: not inside a git repository — skipping .env gitignore check."
+    return 0
+  fi
+
+  git check-ignore -q "$ENV_FILE" 2>/dev/null && return 0
+
+  cat >&2 <<EOF
+
+PREFLIGHT FAILED: .env is not protected by .gitignore
+──────────────────────────────────────────────────────
+A .env file was found in $(pwd) but git will track it.
+Committing this file would expose database credentials.
+
+Fix this before continuing:
+
+  Option 1 — Add .env to the repo .gitignore (recommended):
+    echo '.env' >> .gitignore
+    git add .gitignore
+    git commit -m "chore: ignore .env credential file"
+
+  Option 2 — Add .env to your global gitignore (applies to all repos):
+    echo '.env' >> ~/.gitignore_global
+    git config --global core.excludesfile ~/.gitignore_global
+
+  Then re-run: ./dbmigrate
+
+Note: The ~/.my.cnf profile path (-p) does not require a .env file at all.
+Run ./dbmigrate with no arguments for setup instructions.
+
+EOF
+  exit 1
+}
+
+preflight_env_gitignore_check
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# Supports both short and long forms with = or space:
+#   -p dev | -p=dev | --profile dev | --profile=dev
+#   -s my_app | -s=my_app | --schema my_app | --schema=my_app
+# Remaining args are passed through to dbmate unchanged.
+# -----------------------------------------------------------------------------
+PROFILE="${DBMATE_PROFILE:-}"
+SCHEMA="${DBMATE_SCHEMA:-}"
+PASSTHROUGH_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--profile)
+      PROFILE="${2:?--profile requires a value}"; shift 2 ;;
+    -p=*|--profile=*)
+      PROFILE="${1#*=}"; shift ;;
+    -s|--schema)
+      SCHEMA="${2:?--schema requires a value}"; shift 2 ;;
+    -s=*|--schema=*)
+      SCHEMA="${1#*=}"; shift ;;
+    *)
+      PASSTHROUGH_ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#PASSTHROUGH_ARGS[@]} -eq 0 ]; then
+  cat >&2 <<EOF
+Usage: ./dbmigrate [-p <profile>] [-s <schema>] <command> [args]
+
+Commands:
+  new <name>          Generate a new migration file
+  migrate             Apply all pending migrations
+  rollback            Roll back the most recent migration
+  down                Alias for rollback
+  status              Show applied / pending migration state
+  status --exit-code  Exit non-zero if any migrations are pending
+  dump                Write db/schema.sql from the live database
+  load                Load db/schema.sql into the database
+  wait                Wait for the database to become available
+  up                  Create database (if needed) and migrate
+  create              Create the database
+  drop                Drop the database
+
+Options:
+  -p, --profile <name>   Named group in ~/.my.cnf to read credentials from
+  -s, --schema  <name>   Target MySQL schema (database) to migrate
+
+Environment variables:
+  DBMATE_PROFILE         Same as -p/--profile
+  DBMATE_SCHEMA          Same as -s/--schema
+  DBMIGRATE_NETWORK      Docker network to use (default: sandbox-net)
+
+Examples:
+  ./dbmigrate -p dev -s my_app migrate
+  ./dbmigrate -p dev -s my_app new add_phone_to_users
+  ./dbmigrate -p dev -s my_app status --exit-code
+EOF
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Validate working directory — must be run from repo root
+# -----------------------------------------------------------------------------
+if [ ! -d "$MIGRATIONS_DIR" ]; then
+  error "$(pwd)/$MIGRATIONS_DIR not found."
+  error "Run dbmigrate from the repository root."
+  exit 1
+fi
+
+# Ensure schema.sql exists so the volume mount does not fail on first run
+if [ ! -f "$SCHEMA_FILE" ]; then
+  info "Creating empty $SCHEMA_FILE for initial volume mount."
+  mkdir -p "$(dirname "$SCHEMA_FILE")"
+  touch "$SCHEMA_FILE"
+fi
+
+# -----------------------------------------------------------------------------
+# Credential resolution
+# -----------------------------------------------------------------------------
+DATABASE_URL=""
+
+# Path 1: -p/--profile + -s/--schema
+if [ -n "$PROFILE" ] && [ -n "$SCHEMA" ]; then
+
+  if ! command -v my_print_defaults &>/dev/null; then
+    error "my_print_defaults not found. Install the MySQL client package."
+    error "  macOS:  brew install mysql-client"
+    error "  Ubuntu: sudo apt install mysql-server-core-8.0"
+    exit 1
+  fi
+
+  DB_USER="" DB_PASS="" DB_HOST="" DB_PORT="3306"
+
+  while IFS= read -r line; do
+    case "$line" in
+      --user=*)     DB_USER="${line#--user=}" ;;
+      --password=*) DB_PASS="${line#--password=}" ;;
+      --host=*)     DB_HOST="${line#--host=}" ;;
+      --port=*)     DB_PORT="${line#--port=}" ;;
+    esac
+  done < <(my_print_defaults --show "$PROFILE" 2>/dev/null)
+
+  # If all fields are empty the profile was not found at all — check whether
+  # the group header exists before deciding how to respond.
+  if [ -z "$DB_USER" ] && [ -z "$DB_PASS" ] && [ -z "$DB_HOST" ]; then
+    if grep -q "^\[${PROFILE}\]" "${HOME}/.my.cnf" 2>/dev/null; then
+      # Group header exists but fields are missing — could be a partial or
+      # malformed entry. Don't auto-append a duplicate group; ask for manual fix.
+      error "Profile [${PROFILE}] exists in ~/.my.cnf but is missing required fields."
+      error "Open ~/.my.cnf and ensure the group has user, password, host, and port:"
+      error "  [${PROFILE}]"
+      error "  user     = your_user"
+      error "  password = your_password"
+      error "  host     = your_host"
+      error "  port     = 3306"
+      exit 1
+    fi
+    # Group not found at all — offer to create it interactively
+    setup_profile_wizard "$PROFILE"
+    # Re-read now that the profile has been written
+    while IFS= read -r line; do
+      case "$line" in
+        --user=*)     DB_USER="${line#--user=}" ;;
+        --password=*) DB_PASS="${line#--password=}" ;;
+        --host=*)     DB_HOST="${line#--host=}" ;;
+        --port=*)     DB_PORT="${line#--port=}" ;;
+      esac
+    done < <(my_print_defaults "$PROFILE" 2>/dev/null)
+  fi
+
+  # Final field validation after wizard or normal read
+  MISSING=()
+  [ -z "$DB_USER" ] && MISSING+=("user")
+  [ -z "$DB_PASS" ] && MISSING+=("password")
+  [ -z "$DB_HOST" ] && MISSING+=("host")
+
+  if [ ${#MISSING[@]} -gt 0 ]; then
+    error "Profile [${PROFILE}] in ~/.my.cnf is still missing: ${MISSING[*]}"
+    error "Open ~/.my.cnf and add the missing fields, then re-run."
+    exit 1
+  fi
+
+  DATABASE_URL="mysql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${SCHEMA}?${DB_OPTIONS}"
+  unset DB_USER DB_PASS DB_HOST DB_PORT
+
+  info "Profile: [${PROFILE}] · Schema: ${SCHEMA}"
+
+# Path 2: .env fallback (preflight already confirmed it is gitignored)
+elif [ -f "$ENV_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  if [ -z "${DATABASE_URL:-}" ]; then
+    error ".env file found but DATABASE_URL is not set inside it."
+    exit 1
+  fi
+  info "Credentials resolved from .env — confirm DATABASE_URL targets the correct schema."
+
+# Path 3: nothing found
+else
+  print_setup_instructions
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Validate DATABASE_URL structure and network reachability
+# -----------------------------------------------------------------------------
+validate_database_url "$DATABASE_URL"
+
+# -----------------------------------------------------------------------------
+# Docker run
+# -----------------------------------------------------------------------------
+docker run --rm \
+  --network "$DOCKER_NETWORK" \
+  -e DATABASE_URL="$DATABASE_URL" \
+  -e DBMATE_NO_DUMP_SCHEMA=true \
+  -v "$(pwd)/${MIGRATIONS_DIR}":/db/migrations \
+  -v "$(pwd)/${SCHEMA_FILE}":/db/schema.sql \
+  "$DBMATE_IMAGE" \
+  "${PASSTHROUGH_ARGS[@]}"
+
